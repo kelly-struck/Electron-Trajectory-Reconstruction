@@ -30,8 +30,8 @@ Our solution uses a **Hierarchical "Divide-and-Conquer" Framework** that adapts 
 
 We don't treat all events the same. An SVM classifier acts as a reliable router (98.4% accuracy), instantly categorizing events into:
 
-- **Standard Incidence ($0^{\circ}$--$60^{\circ}$)**
-- **Large Incidence ($60^{\circ}$--$90^{\circ}$)**
+- **Standard Incidence (0°--60°)**
+- **Large Incidence (60°--90°)**
 
 ### 2. 🧠 Standard Angle: Physics-Guided Hybrid Neural Network (PGHNN)
 
@@ -85,3 +85,4 @@ If you find this work useful for your research, please consider citing our paper
   year={2025}
 }
 ```
+

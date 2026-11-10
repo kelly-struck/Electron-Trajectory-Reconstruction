@@ -373,24 +373,36 @@ numpy
 scikit-learn             # SVM router fitting
 ```
 
-### Train an expert
+### Data layout
 
-Both branches are standalone, self-running training scripts that read TFRecord shards from `./data/`:
+Both experts read TFRecord shards. Paths are placeholders — set `BGO_DATA_DIR` or edit the top of each script:
 
 ```
 data/
-├── train.tfrecord
-└── val.tfrecord
+├── train.tfrecord                 # standard-angle sample  (0°–70°)
+├── val.tfrecord
+├── large_angle_train.tfrecord     # large-angle sample     (50°–90°)
+└── large_angle_val.tfrecord
 ```
-
-```bash
-python tools/standard.py       # PGHNN  — standard angle (0°–60°)
-python tools/large_angle.py    # DLD    — large angle   (60°–90°)
-```
-
-Each script builds its own input pipeline, constructs the network, trains with early stopping on the validation angular error, and runs the evaluation. `tools/standard.py` additionally carries the CoG physics baseline (`physics_method_prediction`), which supplies both the gated-fusion reference and the "Standard BGO Algorithm" numbers in the tables above.
 
 Simulation samples and trained weights are **not** distributed with this repository — see [Data & Code Availability](#-data--code-availability).
+
+### Train the experts
+
+```bash
+python tools/standard.py       # PGHNN — standard angle (0°–70° training support)
+python tools/large_angle.py    # DLD   — large angle    (50°–90° training support)
+```
+
+Each script builds its own input pipeline, constructs the network, trains with early stopping on `val_direction_output_angle_error`, and writes checkpoints, a CSV training history and the final model.
+
+### Train the routing classifier
+
+```bash
+python tools/train_angle_classifier.py    # reads $BGO_ANGLE_CSV, writes $BGO_SVM_OUT
+```
+
+The SVM needs a CSV with `barE_0 … barE_307` and `PriDirec_0 … PriDirec_2` columns. It derives the 7-D morphology features and the $\theta > 60^{\circ}$ label from those, then fits `StandardScaler → SVC(kernel="rbf", C=10, gamma="scale")` on 50,000 events.
 
 ### Event representation
 
@@ -408,8 +420,9 @@ From that matrix the models derive:
 ```
 .
 ├── tools/
-│   ├── standard.py            # PGHNN — physics-guided hybrid model (0°–60°)
-│   └── large_angle.py         # DLD — deep-learning-dominant model (60°–90°)
+│   ├── standard.py                # PGHNN — physics-guided hybrid model (0°–60°)
+│   ├── large_angle.py             # DLD — deep-learning-dominant model (60°–90°)
+│   └── train_angle_classifier.py  # SVM router — 7-D shower morphology → 0–60° / 60–90°
 │
 ├── paper/
 │   ├── paper_update_polish_new.tex   # manuscript source (elsarticle)
@@ -421,7 +434,7 @@ From that matrix the models derive:
 └── graph/                     # figures from an earlier revision (kept for history)
 ```
 
-> This release contains the two expert models and the manuscript. Data conversion (ROOT → CSV → TFRecord), the energy-binned variants, the e/p classifier and the ablation suite are not included here.
+> This release contains the two expert models, the routing classifier and the manuscript. Data conversion (ROOT → CSV → TFRecord), the energy-binned variants, the e/p classifier and the ablation suite are not included here.
 
 
 ---

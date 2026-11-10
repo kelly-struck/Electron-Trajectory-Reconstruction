@@ -257,7 +257,10 @@ def parse_tfrecord(example_proto):
         **{f'barE_{i}': tf.io.FixedLenFeature([22], tf.float32) for i in range(14)},
         'PriDirec_0': tf.io.FixedLenFeature([], tf.float32),
         'PriDirec_1': tf.io.FixedLenFeature([], tf.float32),
-        'PriDirec_2': tf.io.FixedLenFeature([], tf.float32)
+        'PriDirec_2': tf.io.FixedLenFeature([], tf.float32),
+        'PriPoint_0': tf.io.FixedLenFeature([], tf.float32),
+        'PriPoint_1': tf.io.FixedLenFeature([], tf.float32),
+        'PriPoint_2': tf.io.FixedLenFeature([], tf.float32)
     }
     parsed = tf.io.parse_single_example(example_proto, feature_description)
 
@@ -280,14 +283,28 @@ def parse_tfrecord(example_proto):
     # Physics feature extraction (Simplified version, actual training should use complex implementation)
     physics_features = tf.zeros((24,), dtype=tf.float32)  # Placeholder
 
-    # Targets: PriDirec_0, PriDirec_1, PriDirec_2
-    targets = tf.stack([
+    # Direction targets: PriDirec_0..2, L2-normalized
+    direction_targets = tf.stack([
         parsed['PriDirec_0'],
         parsed['PriDirec_1'],
         parsed['PriDirec_2']
     ])
-    targets_norm = tf.norm(targets, axis=0) + 1e-10  # Avoid division by zero
-    targets = targets / targets_norm
+    direction_targets = direction_targets / (tf.norm(direction_targets) + 1e-10)
+
+    # Impact-point targets: PriPoint_0..2 in detector coordinates (mm).
+    # The standard-angle branch also carries a point head (paper Sec. 3.3), but
+    # with a deliberately small weight so that direction regression dominates.
+    point_targets = tf.stack([
+        parsed['PriPoint_0'],
+        parsed['PriPoint_1'],
+        parsed['PriPoint_2']
+    ])
+
+    # Keyed by output name, so each head is matched to its own target
+    targets = {
+        'direction_output': direction_targets,
+        'point_output': point_targets
+    }
 
     # Flatten barE input
     barE_flat = tf.reshape(tf.concat([barE_normalized, barE_log], axis=-1), [-1])
@@ -505,76 +522,78 @@ def build_physics_guided_model():
     z = layers.BatchNormalization()(z)
     z = layers.Dropout(0.1)(z)
 
-    # Model's two outputs:
-    # 1. Direction prediction
+    # Two output heads (paper Sec. 3.3): direction and impact point.
+    # There is no decision head: the fusion gate comes from the validity of the
+    # analytic CoG fit, not from the network.
     direction_output = layers.Dense(3, name='direction_output')(z)
+    point_output = layers.Dense(3, name='point_output')(z)
 
-    # 2. Decision network output - Used to judge whether to use physics method
-    decision_output = layers.Dense(1, activation='sigmoid', name='decision_output')(z)
-
-    # Create model
     model = tf.keras.Model(
         inputs=[barE_input, physics_input],
-        outputs=[direction_output, decision_output]
+        outputs=[direction_output, point_output]
     )
 
     return model
 
-# Physics Method Prediction
-def physics_method_prediction(barE_data):
-    """Use traditional physics method for prediction, return direction vector"""
-    # This function should contain the complete implementation of the traditional physics method
-    # For simplification, returning a random value here
-    batch_size = barE_data.shape[0]
-    # In actual application, full physics method should be implemented
-    return tf.random.normal((batch_size, 3))
+# The energy-weighted CoG reconstruction (the Standard BGO Algorithm) is
+# implemented in HybridPredictionModel._apply_physics_method below; it supplies
+# D_phy for the validity-gated fusion.
 
-# Custom Loss Function - Completely rewritten to avoid shape incompatibility
+# Direction loss for the standard-angle branch (paper Sec. 3.3):
+#   alpha * MSE + beta * (1 - cos(theta))^2
+# The impact-point term is a Huber loss on a separate head; its weight w_pt is
+# applied via Keras loss_weights, giving the full
+#   alpha*MSE + beta*(1-cos)^2 + w_pt*Huber(delta_H=2.0)
 class PhysicsGuidedLoss(tf.keras.losses.Loss):
-    def __init__(self, alpha=0.6, beta=0.3, gamma=0.1, name="physics_guided_loss"):
+    def __init__(self, alpha=0.1, beta=0.9, name="physics_guided_loss"):
         super().__init__(name=name)
         self.alpha = tf.constant(alpha, dtype=tf.float32)
         self.beta = tf.constant(beta, dtype=tf.float32)
-        self.gamma = tf.constant(gamma, dtype=tf.float32)
-        # Define sub-loss functions
-        self.mse_loss = tf.keras.losses.MeanSquaredError(reduction=tf.keras.losses.Reduction.NONE)
-        self.bce_loss = tf.keras.losses.BinaryCrossentropy(reduction=tf.keras.losses.Reduction.NONE)
 
     def call(self, y_true, y_pred):
-        # Separate predictions
+        # Accept either the bare direction tensor or a multi-output list
         if isinstance(y_pred, (list, tuple)):
-            direction_pred = y_pred[0]  # [batch_size, 3]
-            decision_pred = y_pred[1]   # [batch_size, 1]
+            direction_pred = y_pred[0]
         else:
-            # If prediction is not list/tuple, assume it only contains direction prediction
             direction_pred = y_pred
-            # Create fake decision prediction (zeros)
-            decision_pred = tf.zeros((tf.shape(y_true)[0], 1), dtype=tf.float32)
 
-        # 1. Calculate direction MSE loss
+        if isinstance(y_true, (list, tuple)):
+            y_true = y_true[0]
+
+        # 1. Direction MSE
         mse_loss = tf.reduce_mean(tf.square(y_true - direction_pred))
 
-        # 2. Calculate direction cosine similarity loss
-        # Normalize vectors
+        # 2. Squared cosine term
         y_true_norm = tf.nn.l2_normalize(y_true, axis=-1)
         y_pred_norm = tf.nn.l2_normalize(direction_pred, axis=-1)
-
-        # Calculate cosine similarity for each sample
         cos_sim = tf.reduce_sum(y_true_norm * y_pred_norm, axis=-1)
         cos_sim = tf.clip_by_value(cos_sim, -1.0, 1.0)
         direction_loss = tf.reduce_mean(tf.square(1.0 - cos_sim))
 
-        # 3. Decision loss - Simplified to use scalar ops to avoid shape issues
-        # We ignore actual physics method labels, only using a simple target: decision output should be close to 0.5
-        # This is to avoid broadcasting shape incompatibility
-        default_targets = 0.5 * tf.ones_like(tf.reshape(decision_pred, [-1]))
-        decision_pred_flat = tf.reshape(decision_pred, [-1])
-        decision_loss = tf.reduce_mean(tf.square(default_targets - decision_pred_flat))
+        return self.alpha * mse_loss + self.beta * direction_loss
 
-        # Combine all losses
-        total_loss = self.alpha * mse_loss + self.beta * direction_loss + self.gamma * decision_loss
+    def get_config(self):
+        cfg = super().get_config()
+        cfg['alpha'] = float(self.alpha)
+        cfg['beta'] = float(self.beta)
+        return cfg
 
-        return total_loss
+
+# Huber loss on the impact-point head, threshold delta_H = 2.0 (paper Sec. 3.3)
+class PointHuberLoss(tf.keras.losses.Loss):
+    def __init__(self, delta=2.0, name='point_huber_loss'):
+        super().__init__(name=name)
+        self.delta = delta
+        self.huber = tf.keras.losses.Huber(
+            delta=delta, reduction=tf.keras.losses.Reduction.NONE)
+
+    def call(self, y_true, y_pred):
+        return tf.reduce_mean(self.huber(y_true, y_pred))
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg['delta'] = self.delta
+        return cfg
 
 # Angle Error Metric
 class AngleError(tf.keras.metrics.Metric):
@@ -763,60 +782,51 @@ class HybridPredictionModel(tf.keras.Model):
         return results.stack()
 
     def call(self, inputs):
-        # Get deep learning prediction
-        dl_direction, decision = self.dl_model(inputs)
+        # Deep-learning prediction: direction + impact point (no decision head)
+        dl_direction, dl_point = self.dl_model(inputs)
 
-        # Try physics method prediction
+        # Validity-gated fusion (paper Sec. 3.3):
+        #   D_final = I_valid * D_phy + (1 - I_valid) * D_dl
+        # I_valid comes from the analytic CoG fit, not from the network.
         barE_original = inputs['barE_original']
         try:
             physics_direction = self._apply_physics_method(barE_original)
 
-            # Check if physics prediction is valid (non-zero vector)
+            # I_valid = 1 only if the CoG fit returned a non-degenerate solution
             physics_valid = tf.reduce_sum(tf.square(physics_direction), axis=1) > 1e-6
-            physics_valid = tf.reshape(physics_valid, (-1, 1))
+            gate = tf.cast(tf.reshape(physics_valid, (-1, 1)), tf.float32)
 
-            # Combine decision network and physics validity
-            decision = decision * tf.cast(physics_valid, tf.float32)
-
-            # Fuse predictions
-            # decision is output of decision network, range 0-1, representing weight of physics method
-            final_direction = decision * physics_direction + (1 - decision) * dl_direction
+            final_direction = gate * physics_direction + (1 - gate) * dl_direction
 
             # Normalize final direction
             final_direction = tf.nn.l2_normalize(final_direction, axis=1)
 
-            return final_direction, decision
-        except:
-            # Physics method failed, use only DL method
-            return dl_direction, tf.zeros_like(decision)
+            return final_direction, gate
+        except Exception:
+            # Analytic method unusable: I_valid = 0, fall back to the network
+            gate = tf.zeros((tf.shape(dl_direction)[0], 1), dtype=tf.float32)
+            return dl_direction, gate
 
     def predict_with_physics(self, inputs):
-        """Hybrid prediction using physics method and deep learning model"""
-        # Get DL model predictions
+        """Hybrid prediction: analytic CoG where its fit is valid, DL otherwise."""
         dl_outputs = self.dl_model(inputs)
         dl_direction = dl_outputs[0]
-        decision_pred = dl_outputs[1]
 
-        # Physics method prediction
         try:
             barE_original = inputs['barE_original']
             physics_direction = self._apply_physics_method(barE_original)
 
-            # Check if physics prediction is valid
             physics_valid = tf.reduce_sum(tf.square(physics_direction), axis=1) > 1e-6
-            physics_valid = tf.reshape(physics_valid, (-1, 1))
+            gate = tf.cast(tf.reshape(physics_valid, (-1, 1)), tf.float32)
 
-            # Apply decision model, combined with physics validity
-            used_decision = decision_pred * tf.cast(physics_valid, tf.float32)
-
-            # Fuse predictions
-            final_direction = used_decision * physics_direction + (1 - used_decision) * dl_direction
+            final_direction = gate * physics_direction + (1 - gate) * dl_direction
             final_direction = tf.nn.l2_normalize(final_direction, axis=-1)
 
-            return final_direction, used_decision
+            return final_direction, gate
         except Exception as e:
             print(f"Physics method prediction failed: {e}")
-            return dl_direction, tf.zeros_like(decision_pred)
+            gate = tf.zeros((tf.shape(dl_direction)[0], 1), dtype=tf.float32)
+            return dl_direction, gate
 
 # Custom Learning Rate Schedule
 class CyclicalLearningRate(tf.keras.optimizers.schedules.LearningRateSchedule):
@@ -968,9 +978,9 @@ def evaluate_hybrid_model(model, test_dataset, output_dir='./results'):
     for inputs, targets in test_dataset:
         # Use predict_with_physics method
         predictions, decisions = model.predict_with_physics(inputs)
-        all_predictions.append(predictions)
-        all_true_values.append(targets)
-        all_decisions.append(decisions)
+        all_predictions.append(np.asarray(predictions))
+        all_true_values.append(np.asarray(targets['direction_output']))
+        all_decisions.append(np.asarray(decisions))
 
     # Concatenate results
     all_predictions = np.vstack(all_predictions)
@@ -1002,14 +1012,13 @@ def evaluate_hybrid_model(model, test_dataset, output_dir='./results'):
     print(f"  68th Percentile: {np.percentile(angle_errors, 68):.2f}°")
     print(f"  95th Percentile: {np.percentile(angle_errors, 95):.2f}°")
 
-    print("\n--- Decision Network Output (Physics Weight) Distribution ---")
+    print("\n--- Analytic Validity Gate (I_valid) Distribution ---")
     print(f"  Mean: {np.mean(all_decisions):.4f}")
     print(f"  Median: {np.median(all_decisions):.4f}")
     print(f"  Std Dev: {np.std(all_decisions):.4f}")
     print(f"  Min: {np.min(all_decisions):.4f}")
     print(f"  Max: {np.max(all_decisions):.4f}")
-    print(f"  Ratio of weight > 0.5: {np.mean(all_decisions > 0.5):.2%}")
-    print(f"  Ratio of weight > 0.8: {np.mean(all_decisions > 0.8):.2%}")
+    print(f"  Fraction of events with a valid analytic fit: {np.mean(all_decisions > 0.5):.2%}")
 
     print("\n--- Overall Performance ---")
     print(f"Average Cosine Similarity: {np.mean(cosine_sim):.4f}")
@@ -1083,9 +1092,18 @@ def main():
             clipnorm=0.5)
 
         # Compile model - force eager execution
+        # Composite loss (paper Sec. 3.3):
+        #   0.1 * MSE + 0.9 * (1 - cos)^2 + 0.01 * Huber(delta_H = 2.0)
         physics_guided_model.compile(
             optimizer=optimizer,
-            loss=PhysicsGuidedLoss(alpha=0.6, beta=0.3, gamma=0.1),
+            loss={
+                'direction_output': PhysicsGuidedLoss(alpha=0.1, beta=0.9),
+                'point_output': PointHuberLoss(delta=2.0),
+            },
+            loss_weights={
+                'direction_output': 1.0,
+                'point_output': 0.01,
+            },
             metrics={'direction_output': [AngleError(), CosineSimilarity()]},
             run_eagerly=True  # Avoid graph compilation
         )
